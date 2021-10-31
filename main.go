@@ -23,7 +23,7 @@ import (
 	"github.com/manishrjain/keys"
 )
 
-const defaultTxnTemplateString = "{{.Date.Format \"2006/01/02\"}}\t{{.Payee}}\n\t{{.To | printf \"%-20s\"}}\t{{.Amount | printf `%.2f`}}{{.Currency}}\n\t{{.From}}\n\n"
+const defaultTxnTemplateString = "{{.Date.Format \"2006-01-02\"}}  {{.Payee}}\n    {{.To | printf \"%-20s\"}}    {{.Amount | printf `%.2f`}}{{.Currency}}\n    {{.From}}\n\n"
 
 // Name for a pseudo-account holding common configuration to all accounts
 const commonAccount = "_"
@@ -61,7 +61,7 @@ var (
 	racc   = regexp.MustCompile(`^account[\W]+(.*)`)
 	ralias = regexp.MustCompile(`\balias\s(.*)`)
 
-	stamp            = "2006/01/02"
+	stamp            = "2006-01-02"
 	bucketName       = []byte("txns")
 	descLength       = 40
 	catLength        = 20
@@ -414,7 +414,7 @@ func main() {
 	final := p.iterateDB()
 	sort.Sort(byTime(final))
 
-	_, err = of.WriteString(fmt.Sprintf("; into-ledger run at %v\n\n", time.Now()))
+	_, err = of.WriteString("\n")
 	checkf(err, "Unable to write into output file: %v", of.Name())
 
 	for _, t := range final {

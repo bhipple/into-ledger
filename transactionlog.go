@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"strings"
 	"text/template"
 	"time"
@@ -50,6 +51,7 @@ func newTransactionTemplate(txnTemplateString string) (*template.Template, error
 // provided template.
 func ledgerFormat(t Txn, tmpl *template.Template) string {
 	var b strings.Builder
+	t.Cur = math.Abs(t.Cur)
 	tmpl.Execute(&b, toTxnTemplate(t))
 	return b.String()
 }
