@@ -235,6 +235,7 @@ func (p *parser) parseTransactions() {
 		p.txns = append(p.txns, t)
 
 		assignForAccount(t.To)
+		existingAccounts.Add(t.To)
 	}
 }
 
@@ -261,6 +262,7 @@ func (p *parser) parseAccounts() {
 			comments = nil
 			p.accounts = append(p.accounts, acc)
 			assignForAccount(acc)
+			existingAccounts.Add(acc)
 			continue
 		}
 
@@ -844,7 +846,7 @@ func (p *parser) categorizeTxn(t *Txn, idx, total int) float64 {
 
 	clear()
 	printSummary(*t, idx, total)
-	return p.printAndGetResult(*short, t)
+	return p.fuzzyAndGetResult(&existingAccounts, t)
 }
 
 func (p *parser) classifyTxn(t *Txn) {
@@ -1890,6 +1892,16 @@ func main() {
 		}
 	}
 
+	payeeSubstitutionsPath := path.Join(*configDir, *payeeSubstitutionsFile)
+	if substData, err := os.ReadFile(payeeSubstitutionsPath); err == nil {
+		checkf(yaml.Unmarshal(substData, &payeeSubsts),
+			"Unable to unmarshal yaml config at %v", payeeSubstitutionsPath)
+	} else if *debug {
+		fmt.Printf("No payee substitution file found at %v\n", payeeSubstitutionsPath)
+	}
+	defer payeeSubsts.Persist(payeeSubstitutionsPath)
+	existingPayees = listPayee()
+
 	data, err = os.ReadFile(*journal)
 	checkf(err, "Unable to read file: %v", *journal)
 	alldata := includeAll(path.Dir(*journal), data)
@@ -1973,6 +1985,7 @@ func main() {
 		}
 	}
 	if len(txns) > 0 {
+		performPayeeSubstitution(txns, payeeSubsts, &existingPayees)
 		sort.Sort(byTime(txns))
 		fmt.Println("Earliest and Latest transactions:")
 		printSummary(txns[0], 1, 2)
