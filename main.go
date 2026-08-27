@@ -1000,7 +1000,7 @@ func ledgerFormat(t Txn) string {
 	if len(t.AIReason) > 0 {
 		b.WriteString(fmt.Sprintf("    ; %s\n", t.AIReason))
 	}
-	b.WriteString(fmt.Sprintf("\t%-20s\t%s %.2f\n", t.To, t.CurName, math.Abs(t.Cur)))
+	b.WriteString(fmt.Sprintf("\t%-20s\t%s%.2f\n", t.To, t.CurName, math.Abs(t.Cur)))
 	b.WriteString(fmt.Sprintf("\t%s\n\n", t.From))
 	return b.String()
 }
