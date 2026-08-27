@@ -1892,16 +1892,6 @@ func main() {
 		}
 	}
 
-	payeeSubstitutionsPath := path.Join(*configDir, *payeeSubstitutionsFile)
-	if substData, err := os.ReadFile(payeeSubstitutionsPath); err == nil {
-		checkf(yaml.Unmarshal(substData, &payeeSubsts),
-			"Unable to unmarshal yaml config at %v", payeeSubstitutionsPath)
-	} else if *debug {
-		fmt.Printf("No payee substitution file found at %v\n", payeeSubstitutionsPath)
-	}
-	defer payeeSubsts.Persist(payeeSubstitutionsPath)
-	existingPayees = listPayee()
-
 	data, err = os.ReadFile(*journal)
 	checkf(err, "Unable to read file: %v", *journal)
 	alldata := includeAll(path.Dir(*journal), data)
@@ -1985,7 +1975,7 @@ func main() {
 		}
 	}
 	if len(txns) > 0 {
-		performPayeeSubstitution(txns, payeeSubsts, &existingPayees)
+		performPayeeSubstitution(txns)
 		sort.Sort(byTime(txns))
 		fmt.Println("Earliest and Latest transactions:")
 		printSummary(txns[0], 1, 2)

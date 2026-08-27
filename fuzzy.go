@@ -35,11 +35,6 @@ func (s stringSet) Add(i string) {
 	s[i] = struct{}{}
 }
 
-func (s stringSet) Contains(i string) bool {
-	_, has := s[i]
-	return has
-}
-
 // ToSlice returns the items in sorted order, so the fuzzy menu is stable
 // between runs.
 func (s stringSet) ToSlice() []string {
@@ -69,30 +64,14 @@ func runCommand(name string, arg ...string) []string {
 type Fzf struct {
 	// Items to be selected by user
 	Items []string
-	// If prompt is set "", a default prompt is used.
-	Prompt string
-	//  Used to fill the search field
-	Query string
-	// Returns what the user searched for
-	ReturnQuery bool
 	// More arguments to the fzf command
 	MoreArgs []string
 }
 
 // fuzzySelect prompts the user to select one or more items in a fuzzy menu.
 func fuzzySelect(f Fzf) (selected []string) {
-	args := []string{}
-	if f.Prompt != "" {
-		args = append(args, "--prompt", f.Prompt+" >")
-	}
-	if f.ReturnQuery {
-		// Print what the user entered first-line
-		args = append(args, "--print-query")
-	}
-	args = append(args, "--query", f.Query)
 	// Default options, TODO Make this configurable
-	args = append(args, "--height", "80%", "--layout=reverse")
-	// Other options
+	args := []string{"--height", "80%", "--layout=reverse"}
 	args = append(args, f.MoreArgs...)
 	// Inspired from https://stackoverflow.com/a/23167416/ by mraron (Apache
 	// 2.0 licence)
@@ -114,12 +93,8 @@ func fuzzySelect(f Fzf) (selected []string) {
 	buf.ReadFrom(stdout)
 	s := buf.String()
 	subProcess.Wait()
-	for i, s := range strings.Split(s, "\n") {
-		switch {
-		// Always keep user query even if it is empty
-		case f.ReturnQuery && i == 0:
-			selected = append(selected, s)
-		case s != "":
+	for _, s := range strings.Split(s, "\n") {
+		if s != "" {
 			selected = append(selected, s)
 		}
 	}
