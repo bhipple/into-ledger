@@ -61,7 +61,7 @@ var (
 	racc = regexp.MustCompile(`^account[\W]+(.*)`)
 
 	debugPrefix = "_debug.batch"
-	stamp       = "2006/01/02"
+	stamp       = "2006-01-02"
 	bucketName  = []byte("txns")
 	descLength  = 40
 	catLength   = 20
