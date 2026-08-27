@@ -2057,7 +2057,7 @@ func main() {
 	final := p.iterateDB()
 	sort.Sort(byTime(final))
 
-	_, err = fmt.Fprintf(of, "; into-ledger run at %v\n\n", time.Now())
+	_, err = of.WriteString("\n")
 	checkf(err, "Unable to write into output file: %v", of.Name())
 
 	for _, t := range final {
