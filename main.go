@@ -1616,6 +1616,11 @@ func (p *parser) processAIReview(txns []Txn, outputPath string, apiKey string, m
 	return allTxns, nil
 }
 
+// removeDuplicates drops CSV txns already present in the journal. A candidate
+// matches a journal posting to the same account with the same description and
+// amount, dated within -within hours. Each posting absorbs at most one candidate,
+// so repeat purchases (same merchant and amount on adjacent days) are kept; exact
+// date matches are paired first so a neighbouring day can't steal them.
 func (p *parser) removeDuplicates(txns []Txn) []Txn {
 	if len(txns) == 0 {
 		return txns
@@ -1624,39 +1629,57 @@ func (p *parser) removeDuplicates(txns []Txn) []Txn {
 	sort.Sort(byTime(p.txns))
 	sort.Sort(byTime(txns))
 
+	allowed := time.Duration(*dupWithin) * time.Hour
 	prev := p.txns
-	first := txns[0].Date.Add(-24 * time.Hour)
+	first := txns[0].Date.Add(-allowed)
 	for i, t := range p.txns {
-		if t.Date.After(first) {
+		if !t.Date.Before(first) {
 			prev = p.txns[i:]
 			break
 		}
 	}
 
-	allowed := time.Duration(*dupWithin) * time.Hour
 	within := func(a, b time.Time) bool {
-		dur := a.Sub(b)
-		return math.Abs(float64(dur)) <= float64(allowed)
+		return math.Abs(float64(a.Sub(b))) <= float64(allowed)
 	}
 
+	used := make([]bool, len(prev))
+	dup := make([]bool, len(txns))
+	match := func(exact bool) {
+		for i, t := range txns {
+			if dup[i] {
+				continue
+			}
+			tdesc := sanitize(t.Desc)
+			src := t.sourceAccount()
+			for j, pr := range prev {
+				if pr.Date.After(t.Date.Add(allowed)) {
+					break
+				}
+				if used[j] || pr.To != src || math.Abs(pr.Cur) != math.Abs(t.Cur) {
+					continue
+				}
+				if exact && !pr.Date.Equal(t.Date) || !within(pr.Date, t.Date) {
+					continue
+				}
+				if sanitize(pr.Desc) != tdesc {
+					continue
+				}
+				used[j], dup[i] = true, true
+				break
+			}
+		}
+	}
+	match(true)
+	match(false)
+
 	final := txns[:0]
-	for _, t := range txns {
-		var found bool
-		tdesc := sanitize(t.Desc)
-		for _, pr := range prev {
-			if pr.Date.After(t.Date.Add(allowed)) {
-				break
-			}
-			pdesc := sanitize(pr.Desc)
-			if tdesc == pdesc && within(pr.Date, t.Date) && math.Abs(pr.Cur) == math.Abs(t.Cur) {
-				printSummary(t, 0, 0)
-				found = true
-				break
-			}
+	for i, t := range txns {
+		if dup[i] {
+			printSummary(t, 0, 0)
+			continue
 		}
-		if !found {
-			final = append(final, t)
-		}
+		final = append(final, t)
 	}
 	fmt.Printf("\t%d duplicates found and ignored.\n\n", len(txns)-len(final))
 	return final
