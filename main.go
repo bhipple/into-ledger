@@ -128,18 +128,17 @@ type AIResponse struct {
 }
 
 type Txn struct {
-	Date               time.Time
-	Desc               string
-	To                 string
-	From               string
-	Cur                float64
-	CurName            string
-	Key                []byte
-	skipClassification bool
-	Done               bool
-	Account            string          // Account from CSV (e.g., "Chase Bank - JAIN CHK (8987)")
-	AIReason           string          // AI's reasoning for categorization (for manual review context)
-	AISuggestions      []CategoryScore // AI suggested categories with confidence scores (up to 3)
+	Date          time.Time
+	Desc          string
+	To            string
+	From          string
+	Cur           float64
+	CurName       string
+	Key           []byte
+	Done          bool
+	Account       string          // Account from CSV (e.g., "Chase Bank - JAIN CHK (8987)")
+	AIReason      string          // AI's reasoning for categorization (for manual review context)
+	AISuggestions []CategoryScore // AI suggested categories with confidence scores (up to 3)
 }
 
 type byTime []Txn
@@ -191,6 +190,7 @@ type parser struct {
 	db              *bolt.DB
 	data            []byte
 	txns            []Txn
+	examples        []Txn // training pairs: To is the counterparty, From is the source account
 	classes         []bayesian.Class
 	cl              *bayesian.Classifier
 	accounts        []string
@@ -198,11 +198,34 @@ type parser struct {
 	accountComments map[string]string // maps account names to their comments/descriptions
 }
 
+const ledgerCSVFormat = `%(quoted(filename)),%(quoted(xact.beg_line)),%(quoted(date)),%(quoted(code)),` +
+	`%(quoted(payee)),%(quoted(display_account)),%(quoted(commodity(scrub(display_amount)))),` +
+	`%(quoted(quantity(scrub(display_amount))))\n`
+
+func isEquity(account string) bool {
+	return account == "Equity" || strings.HasPrefix(account, "Equity:")
+}
+
+func isImportSource(account string) bool {
+	if strings.HasPrefix(account, "Assets:Reimbursements:") {
+		return false
+	}
+	return strings.HasPrefix(account, "Assets:") || strings.HasPrefix(account, "Liabilities:")
+}
+
+func (t Txn) sourceAccount() string {
+	if t.Cur > 0 {
+		return t.To
+	}
+	return t.From
+}
+
 func (p *parser) parseTransactions() {
-	out, err := exec.Command("ledger", "-f", *journal, "csv").Output()
+	out, err := exec.Command("ledger", "-f", *journal, "csv", "--csv-format", ledgerCSVFormat).Output()
 	checkf(err, "Unable to convert journal to csv. Possibly an issue with your ledger installation.")
 	r := csv.NewReader(newConverter(bytes.NewReader(out)))
-	var t Txn
+	var xactOrder []string
+	xacts := make(map[string][]Txn)
 	for {
 		cols, err := r.Read()
 		if err == io.EOF {
@@ -210,32 +233,47 @@ func (p *parser) parseTransactions() {
 		}
 		checkf(err, "Unable to read a csv line.")
 
-		t = Txn{}
-		t.Date, err = time.Parse(stamp, cols[0])
-		checkf(err, "Unable to parse time: %v", cols[0])
-		t.Desc = strings.Trim(cols[2], " \n\t")
-
-		t.To = cols[3]
+		var t Txn
+		t.Date, err = time.Parse(stamp, cols[2])
+		checkf(err, "Unable to parse time: %v", cols[2])
+		t.Desc = strings.Trim(cols[4], " \n\t")
+		t.To = cols[5]
 		assertf(len(t.To) > 0, "Expected TO, found empty.")
-		if strings.HasPrefix(t.To, "Assets:Reimbursements:") {
-			// pass
-		} else if strings.HasPrefix(t.To, "Assets:") {
-			// Don't pick up Assets.
-			t.skipClassification = true
-		} else if strings.HasPrefix(t.To, "Equity:") {
-			// Don't pick up Equity.
-			t.skipClassification = true
-		} else if strings.HasPrefix(t.To, "Liabilities:") {
-			// Don't pick up Liabilities.
-			t.skipClassification = true
-		}
-		t.CurName = cols[4]
-		t.Cur, err = strconv.ParseFloat(cols[5], 64)
+		t.CurName = cols[6]
+		t.Cur, err = strconv.ParseFloat(cols[7], 64)
 		checkf(err, "Unable to parse amount.")
 		p.txns = append(p.txns, t)
 
+		key := cols[0] + ":" + cols[1]
+		if _, ok := xacts[key]; !ok {
+			xactOrder = append(xactOrder, key)
+		}
+		xacts[key] = append(xacts[key], t)
+
 		assignForAccount(t.To)
 		existingAccounts.Add(t.To)
+	}
+
+	for _, key := range xactOrder {
+		postings := xacts[key]
+		for i, src := range postings {
+			if !isImportSource(src.To) {
+				continue
+			}
+			for j, dst := range postings {
+				if i == j || dst.To == src.To || isEquity(dst.To) {
+					continue
+				}
+				p.examples = append(p.examples, Txn{
+					Date:    dst.Date,
+					Desc:    dst.Desc,
+					To:      dst.To,
+					From:    src.To,
+					Cur:     dst.Cur,
+					CurName: dst.CurName,
+				})
+			}
+		}
 	}
 }
 
@@ -358,28 +396,24 @@ func (p *parser) matchAccountToLedger(csvAccount string) string {
 	return ""
 }
 
-// prepareDescriptionForClassification prepares a description for Bayesian classification
-// by converting to lowercase, removing noise words, and splitting into terms
-func prepareDescriptionForClassification(desc string) []string {
+// classificationTerms lowercases the description, strips noise, and appends
+// a token for the account the money moved through, so the classifier learns
+// counterparties per source account (e.g. a checking debit vs. a card charge).
+func classificationTerms(desc, source string) []string {
 	desc = strings.ToLower(desc)
-
-	// Remove "privacycom" keyword (case-insensitive)
-	// This handles cases like "Privacycom *Merchant" or "*Privacycom Merchant"
 	desc = strings.ReplaceAll(desc, "privacycom", " ")
 	desc = strings.ReplaceAll(desc, "*", " ")
-
-	// Split and filter empty strings
-	terms := strings.Fields(desc) // Fields splits on whitespace and removes empty strings
+	terms := strings.Fields(desc)
+	if len(source) > 0 {
+		terms = append(terms, "src:"+strings.ToLower(source))
+	}
 	return terms
 }
 
 func (p *parser) generateClasses() {
 	p.classes = make([]bayesian.Class, 0, 10)
 	tomap := make(map[string]bool)
-	for _, t := range p.txns {
-		if t.skipClassification {
-			continue
-		}
+	for _, t := range p.examples {
 		tomap[t.To] = true
 	}
 	for class := range tomap {
@@ -392,12 +426,8 @@ func (p *parser) generateClasses() {
 
 	p.cl = bayesian.NewClassifierTfIdf(p.classes...)
 	assertf(p.cl != nil, "Expected a valid classifier. Found nil.")
-	for _, t := range p.txns {
-		if _, has := tomap[t.To]; !has {
-			continue
-		}
-		terms := prepareDescriptionForClassification(t.Desc)
-		p.cl.Learn(terms, bayesian.Class(t.To))
+	for _, t := range p.examples {
+		p.cl.Learn(classificationTerms(t.Desc, t.From), bayesian.Class(t.To))
 	}
 	p.cl.ConvertTermsFreqToTfIdf()
 }
@@ -407,47 +437,61 @@ type pair struct {
 	pos   int
 }
 
-type byScore []pair
-
-func (b byScore) Len() int {
-	return len(b)
-}
-
-func (b byScore) Less(i int, j int) bool {
-	return b[i].score > b[j].score
-}
-
-func (b byScore) Swap(i int, j int) {
-	b[i], b[j] = b[j], b[i]
-}
-
-func (p *parser) topHits(in string) []bayesian.Class {
-	terms := prepareDescriptionForClassification(in)
-	scores, _, _ := p.cl.LogScores(terms)
+// rank returns classifier scores for a description seen on the given source
+// account, best first. The source account itself is never a candidate.
+func (p *parser) rank(desc, source string) []pair {
+	scores, _, _ := p.cl.LogScores(classificationTerms(desc, source))
 	pairs := make([]pair, 0, len(scores))
+	for pos, score := range scores {
+		if string(p.classes[pos]) == source {
+			continue
+		}
+		pairs = append(pairs, pair{score, pos})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].score > pairs[j].score })
+	return pairs
+}
+
+// confidences softmax-normalizes ranked log scores.
+func confidences(pairs []pair) []float64 {
+	out := make([]float64, len(pairs))
+	if len(pairs) == 0 {
+		return out
+	}
+	var sum float64
+	for i, pr := range pairs {
+		out[i] = math.Exp(pr.score - pairs[0].score)
+		sum += out[i]
+	}
+	for i := range out {
+		out[i] /= sum
+	}
+	return out
+}
+
+func (p *parser) topHits(t Txn) []bayesian.Class {
+	pairs := p.rank(t.Desc, t.sourceAccount())
+	if len(pairs) == 0 {
+		return nil
+	}
 
 	var mean, stddev float64
-	for pos, score := range scores {
-		pairs = append(pairs, pair{score, pos})
-		mean += score
+	for _, pr := range pairs {
+		mean += pr.score
 	}
-	mean /= float64(len(scores))
-	for _, score := range scores {
-		diff := score - mean
+	mean /= float64(len(pairs))
+	for _, pr := range pairs {
+		diff := pr.score - mean
 		stddev += diff * diff
 	}
-	stddev /= float64(len(scores) - 1)
+	if len(pairs) > 1 {
+		stddev /= float64(len(pairs) - 1)
+	}
 	stddev = math.Sqrt(stddev)
 
-	sort.Sort(byScore(pairs))
 	result := make([]bayesian.Class, 0, 5)
 	last := pairs[0].score
-	maxResults := min(len(pairs), 5)
-	for i := range maxResults {
-		pr := pairs[i]
-		if *debug {
-			// fmt.Printf("i=%d s=%f Class=%v\n", i, pr.score, p.classes[pr.pos])
-		}
+	for _, pr := range pairs[:min(len(pairs), 5)] {
 		if math.Abs(pr.score-last) > stddev {
 			break
 		}
@@ -817,7 +861,7 @@ func (p *parser) categorizeTxn(t *Txn, idx, total int) float64 {
 	}
 	fmt.Println()
 
-	hits := p.topHits(t.Desc)
+	hits := p.topHits(*t)
 	var ks keys.Shortcuts
 	setDefaultMappings(&ks)
 
@@ -856,7 +900,10 @@ func (p *parser) classifyTxn(t *Txn) {
 	}
 
 	if !t.Done {
-		hits := p.topHits(t.Desc)
+		hits := p.topHits(*t)
+		if len(hits) == 0 {
+			return
+		}
 		if t.Cur < 0 {
 			t.To = string(hits[0])
 		} else {
@@ -1120,26 +1167,15 @@ func (p *parser) selectDiverseExamples(category string, maxExamples int) []Examp
 	}
 	var candidates []txnScore
 
-	for _, t := range p.txns {
-		if t.To == category {
-			// Calculate confidence for this transaction
-			terms := prepareDescriptionForClassification(t.Desc)
-			scores, _, _ := p.cl.LogScores(terms)
-
-			// Find the score for this category
-			for i, class := range p.classes {
-				if string(class) == category && i < len(scores) {
-					// Normalize using softmax-like approach
-					maxScore := scores[0]
-					for _, s := range scores {
-						if s > maxScore {
-							maxScore = s
-						}
-					}
-					confidence := math.Exp(scores[i] - maxScore)
-					candidates = append(candidates, txnScore{t, confidence})
-					break
-				}
+	for _, t := range p.examples {
+		if t.To != category {
+			continue
+		}
+		pairs := p.rank(t.Desc, t.From)
+		for _, pr := range pairs {
+			if string(p.classes[pr.pos]) == category {
+				candidates = append(candidates, txnScore{t, math.Exp(pr.score - pairs[0].score)})
+				break
 			}
 		}
 	}
@@ -1209,41 +1245,13 @@ func (p *parser) generateReviewData(txns []Txn) ReviewData {
 	}
 
 	for i, t := range txns {
-		// Get Bayesian classifier predictions
-		terms := prepareDescriptionForClassification(t.Desc)
-		scores, _, _ := p.cl.LogScores(terms)
-
-		// Create pairs of scores and positions
-		type scorePair struct {
-			score float64
-			pos   int
-		}
-		pairs := make([]scorePair, 0, len(scores))
-		for pos, score := range scores {
-			pairs = append(pairs, scorePair{score, pos})
-		}
-		sort.Slice(pairs, func(i, j int) bool {
-			return pairs[i].score > pairs[j].score
-		})
-
-		// Convert log scores to probabilities (normalize)
-		// Using softmax-like normalization
-		maxScore := pairs[0].score
-		var sumExp float64
-		expScores := make([]float64, len(pairs))
-		for i, pr := range pairs {
-			expScores[i] = math.Exp(pr.score - maxScore)
-			sumExp += expScores[i]
-		}
-
-		// Build categories with normalized confidence scores
+		pairs := p.rank(t.Desc, t.sourceAccount())
+		confs := confidences(pairs)
 		categories := make([]CategoryScore, 0, 5)
 		for i := range min(len(pairs), 5) {
-			pr := pairs[i]
-			confidence := expScores[i] / sumExp
 			categories = append(categories, CategoryScore{
-				Category:   string(p.classes[pr.pos]),
-				Confidence: confidence,
+				Category:   string(p.classes[pairs[i].pos]),
+				Confidence: confs[i],
 			})
 		}
 
@@ -1451,44 +1459,16 @@ func (p *parser) processAIReview(txns []Txn, outputPath string, apiKey string, m
 	fmt.Printf("Analyzing %d transactions with Bayesian threshold %.2f...\n", len(txns), confidenceThreshold)
 
 	for _, t := range txns {
-		// Get Bayesian classifier prediction
-		terms := prepareDescriptionForClassification(t.Desc)
-		scores, _, _ := p.cl.LogScores(terms)
-
-		// Find top score and normalize to confidence
-		if len(scores) == 0 {
+		pairs := p.rank(t.Desc, t.sourceAccount())
+		if len(pairs) == 0 {
 			lowConfidenceTxns = append(lowConfidenceTxns, t)
 			continue
 		}
-
-		// Get max score for normalization
-		maxScore := scores[0]
-		for _, score := range scores {
-			if score > maxScore {
-				maxScore = score
-			}
-		}
-
-		// Normalize scores using softmax
-		var sumExp float64
-		expScores := make([]float64, len(scores))
-		for i, score := range scores {
-			expScores[i] = math.Exp(score - maxScore)
-			sumExp += expScores[i]
-		}
-
-		// Get top confidence
-		topConfidence := expScores[0] / sumExp
-		for _, exp := range expScores {
-			conf := exp / sumExp
-			if conf > topConfidence {
-				topConfidence = conf
-			}
-		}
+		topConfidence := confidences(pairs)[0]
 
 		if topConfidence >= confidenceThreshold {
 			// High-confidence Bayesian prediction
-			hits := p.topHits(t.Desc)
+			hits := p.topHits(t)
 			if len(hits) > 0 {
 				if t.Cur > 0 {
 					t.From = string(hits[0])
